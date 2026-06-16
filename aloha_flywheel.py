@@ -145,18 +145,17 @@ def build_lap_dataset(harvest_dir, n_harvest, lap_data_dir):
 
 
 def distill(lap_data_dir, n_eps, in_ckpt_dir, out_ckpt_dir):
-    """(Re)train ACT on the combined dataset (orig + harvested fast demos).
-
-    imitate_episodes trains from scratch, so each lap is a fresh fit on the improved
-    dataset rather than a drift-prone repeated fine-tune. in_ckpt_dir is unused but
-    kept for signature clarity / future warm-start."""
+    """Fine-tune ACT (warm-started from the current policy) on the combined dataset
+    (orig + harvested fast demos). Warm-start matters: from-scratch needs ~2000 epochs;
+    fine-tuning the good base on the fast-enriched data converges in a few hundred."""
     os.makedirs(out_ckpt_dir, exist_ok=True)
     cmd = ['python', 'imitate_episodes.py', '--task_name', f'_flywheel_{TASK}',
            '--ckpt_dir', out_ckpt_dir, '--policy_class', 'ACT', '--kl_weight', '10',
            '--chunk_size', str(CHUNK), '--hidden_dim', '512', '--batch_size', '8',
            '--dim_feedforward', '3200', '--num_epochs', str(DISTILL_EPOCHS),
            '--lr', '1e-5', '--seed', '0']
-    env = dict(os.environ, FLYWHEEL_DATASET_DIR=lap_data_dir, FLYWHEEL_NUM_EPISODES=str(n_eps))
+    env = dict(os.environ, FLYWHEEL_DATASET_DIR=lap_data_dir, FLYWHEEL_NUM_EPISODES=str(n_eps),
+               FLYWHEEL_INIT_CKPT=os.path.join(in_ckpt_dir, 'policy_best.ckpt'))
     subprocess.run(cmd, check=True, env=env)
 
 

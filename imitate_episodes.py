@@ -362,6 +362,9 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
+    _init = os.environ.get('FLYWHEEL_INIT_CKPT', '')
+    if _init and os.path.exists(_init):
+        policy.load_state_dict(torch.load(_init)); print(f'[flywheel] warm-started from {_init}')
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
