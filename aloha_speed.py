@@ -24,12 +24,12 @@ from sim_env import make_sim_env, BOX_POSE
 
 from speedtuning_rl import SpeedQLearner, margin_loss
 
-TASK = 'sim_transfer_cube_scripted'
-CKPT_DIR = 'ckpt/sim_transfer_cube_scripted'
+TASK = os.environ.get('TASK', 'sim_transfer_cube_scripted')
+CKPT_DIR = os.environ.get('BASE_CKPT_DIR', f'ckpt/{TASK}')
 CHUNK = 100
 CAMERAS = ['top']
 STATE_DIM = 14
-MAX_T = 400
+MAX_T = SIM_TASK_CONFIGS[TASK]['episode_len'] if TASK in SIM_TASK_CONFIGS else 400
 
 
 class SpeedPolicy:
@@ -108,10 +108,11 @@ def chunk_embed(ch):  # ch: [T, D] normalized actions
     return np.concatenate([ch.mean(0), ch.std(0), ch[-1] - ch[0]]).astype(np.float32)
 
 
-def build_act():
+def build_act(ckpt_dir=None):
     import sys
+    ckpt_dir = ckpt_dir or CKPT_DIR
     # detr's build parses sys.argv -> give it a valid ACT command (must match the trained arch)
-    sys.argv = ['aloha_speed.py', '--ckpt_dir', CKPT_DIR, '--policy_class', 'ACT',
+    sys.argv = ['aloha_speed.py', '--ckpt_dir', ckpt_dir, '--policy_class', 'ACT',
                 '--task_name', TASK, '--seed', '0', '--num_epochs', '1', '--lr', '1e-5',
                 '--kl_weight', '10', '--chunk_size', str(CHUNK), '--hidden_dim', '512',
                 '--dim_feedforward', '3200', '--batch_size', '8']
@@ -119,9 +120,9 @@ def build_act():
            'dim_feedforward': 3200, 'lr_backbone': 1e-5, 'backbone': 'resnet18',
            'enc_layers': 4, 'dec_layers': 7, 'nheads': 8, 'camera_names': CAMERAS}
     policy = make_policy('ACT', cfg)
-    policy.load_state_dict(torch.load(os.path.join(CKPT_DIR, 'policy_best.ckpt')))
+    policy.load_state_dict(torch.load(os.path.join(ckpt_dir, 'policy_best.ckpt')))
     policy.cuda().eval()
-    with open(os.path.join(CKPT_DIR, 'dataset_stats.pkl'), 'rb') as f:
+    with open(os.path.join(ckpt_dir, 'dataset_stats.pkl'), 'rb') as f:
         st = pickle.load(f)
     pre = lambda q: (q - st['qpos_mean']) / st['qpos_std']
     post = lambda a: a * st['action_std'] + st['action_mean']

@@ -34,8 +34,16 @@ def main(args):
     num_epochs = args['num_epochs']
 
     # get task parameters
-    is_sim = task_name[:4] == 'sim_'
-    if is_sim:
+    is_sim = task_name[:4] == 'sim_' or task_name.startswith('_flywheel_')
+    if task_name.startswith('_flywheel_'):
+        # flywheel distill: dataset dir + episode count come from env (combined orig+harvested)
+        import os as _os
+        base = task_name[len('_flywheel_'):]
+        from constants import SIM_TASK_CONFIGS
+        task_config = dict(SIM_TASK_CONFIGS[base])
+        task_config['dataset_dir'] = _os.environ['FLYWHEEL_DATASET_DIR']
+        task_config['num_episodes'] = int(_os.environ['FLYWHEEL_NUM_EPISODES'])
+    elif is_sim:
         from constants import SIM_TASK_CONFIGS
         task_config = SIM_TASK_CONFIGS[task_name]
     else:
@@ -85,14 +93,16 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'speed': int(os.environ.get('ACT_SPEED', '1')),
+        'num_rollouts': int(os.environ.get('ACT_NUM_ROLLOUTS', '50')),
     }
 
     if is_eval:
         ckpt_names = [f'policy_best.ckpt']
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
+            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=(os.environ.get('ACT_SAVE_VIDEO', '0') == '1'))
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
@@ -193,9 +203,17 @@ def eval_bc(config, ckpt_name, save_episode=True):
         query_frequency = 1
         num_queries = policy_config['num_queries']
 
+    # SpeedTuning fixed-speed baseline: accelerate the chunk by `speed` via linear
+    # temporal interpolation and replan after the (shortened) chunk is consumed.
+    speed = config.get('speed', 1)
+    chunk_len = policy_config['num_queries']
+    if speed > 1 and not temporal_agg:
+        query_frequency = int(np.ceil(chunk_len / speed))
+
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
-    num_rollouts = 50
+    num_rollouts = config.get('num_rollouts', 50)
+    steps_to_success_list = []
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
@@ -257,6 +275,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                    elif speed > 1:
+                        j = t % query_frequency
+                        src = min(j * speed, chunk_len - 1)
+                        lo = int(np.floor(src)); hi = min(lo + 1, chunk_len - 1); frac = src - lo
+                        raw_action = all_actions[:, lo] * (1 - frac) + all_actions[:, hi] * frac
                     else:
                         raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
@@ -283,6 +306,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
             pass
 
         rewards = np.array(rewards)
+        _succ_idx = np.where(rewards == env_max_reward)[0]
+        if len(_succ_idx) > 0:
+            steps_to_success_list.append(int(_succ_idx[0]))   # sim-step of first success
         episode_return = np.sum(rewards[rewards!=None])
         episode_returns.append(episode_return)
         episode_highest_reward = np.max(rewards)
@@ -294,7 +320,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
-    summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
+    mean_s2s = float(np.mean(steps_to_success_list)) if steps_to_success_list else -1.0
+    print(f'[SPEEDBASE] speed={speed} success_rate={success_rate} mean_steps_to_success={mean_s2s} n_success={len(steps_to_success_list)}/{num_rollouts}')
+    summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\nmean_steps_to_success: {mean_s2s}\n\n'
     for r in range(env_max_reward+1):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
