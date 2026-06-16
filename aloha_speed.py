@@ -185,7 +185,7 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
                     success, s2s = True, t
             done = success or t >= MAX_T
             r = alpha * (v ** beta) + (1.0 if success else 0.0)
-            sp.observe(r, done, chunk_len=L)
+            sp.observe(r, done, chunk_len=(None if os.environ.get('FLAT_DISCOUNT', '') else L))
         SR.append(1.0 if success else 0.0); SPD.append(float(np.mean(speeds)))
         if success:
             S2S.append(s2s)
