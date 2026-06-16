@@ -214,9 +214,12 @@ def main():
         emit(f'--- LAP {lap}  policy={ckpt}  {time.ctime()} ---')
         # 1. controller on current policy (reuse aloha_speed training via subprocess)
         cpath = os.path.join(ROOT, f'controller_lap{lap}.pt')
+        # mono prior on the controller: plain alpha collapses to max speed on cliff
+        # tasks -> harvest/eval over-speed -> 0 SR. mono caps speed -> sane fast demos.
         subprocess.run(['python', 'aloha_speed.py'], check=True, env=dict(
             os.environ, MODE='train', ALPHA=str(ALPHA), SPEED_CKPT=cpath,
-            NUM_EPISODES='200', TASK=TASK, BASE_CKPT_DIR=ckpt, GAMMA='0.99'))
+            NUM_EPISODES='200', TASK=TASK, BASE_CKPT_DIR=ckpt, GAMMA='0.99',
+            MONO_LAMBDA=os.environ.get('CTRL_MONO_LAMBDA', '0.5')))
         from aloha_speed import SpeedPolicy as SP
         feat_dim = 2 * STATE_DIM + 3 * STATE_DIM
         controller = SP(feat_dim, MAX_SPEED - MIN_SPEED + 1, MIN_SPEED, ALPHA, 1.0,
