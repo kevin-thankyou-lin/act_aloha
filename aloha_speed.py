@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from constants import SIM_TASK_CONFIGS
-from utils import sample_box_pose, set_seed
+from utils import sample_box_pose, sample_insertion_pose, set_seed
 from imitate_episodes import make_policy, get_image
 from sim_env import make_sim_env, BOX_POSE
 
@@ -143,7 +143,7 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
         sp.load(speed_ckpt); print(f'loaded speed policy {speed_ckpt}')
     SR, S2S, SPD = [], [], []
     for ep in range(num_episodes):
-        BOX_POSE[0] = sample_box_pose()
+        BOX_POSE[0] = np.concatenate(sample_insertion_pose()) if 'insertion' in TASK else sample_box_pose()
         ts = env.reset()
         frames = collections.deque(maxlen=k_stack)
         t, success, s2s, speeds = 0, False, None, []
