@@ -45,7 +45,8 @@ class SpeedPolicy:
                  gamma=0.9, lr=3e-4, eps_start=0.5, eps_end=0.05,
                  eps_decay=800, bs=128, learn_start=256, target_sync=200, device='cuda',
                  delicacy_path='', margin=1.0, margin_lambda=0.0, k_stack=2, state_dim=14,
-                 mono_lambda=0.0, mono_tau=0.4, adv_bound_lambda=0.0):
+                 mono_lambda=0.0, mono_tau=0.4, adv_bound_lambda=0.0, adv_disc_anchor=1.0,
+                 adv_vbound_lambda=0.0):
         self.min_speed, self.alpha, self.beta = min_speed, alpha, beta
         self.k_stack, self.state_dim, self.device = k_stack, state_dim, device
         self.margin, self.margin_lambda = margin, margin_lambda
@@ -54,11 +55,18 @@ class SpeedPolicy:
             eps_start=eps_start, eps_end=eps_end, eps_decay_steps=eps_decay,
             buffer_size=50000, batch_size=bs, learn_start=learn_start,
             target_sync=target_sync, device=device, train=train,
-            mono_lambda=mono_lambda, mono_tau=mono_tau, adv_bound_lambda=adv_bound_lambda)
+            mono_lambda=mono_lambda, mono_tau=mono_tau, adv_bound_lambda=adv_bound_lambda,
+            adv_vbound_lambda=adv_vbound_lambda)
         if adv_bound_lambda > 0:
             from speedtuning_rl import build_adv_ceiling
-            C = build_adv_ceiling(n_actions, min_speed, alpha=alpha, beta=beta, gamma=gamma, chunk_T=CHUNK)
+            C = build_adv_ceiling(n_actions, min_speed, alpha=alpha, beta=beta, gamma=gamma, chunk_T=CHUNK,
+                                  disc_anchor=adv_disc_anchor)
             self.learner.adv_ceiling = torch.from_numpy(C).to(device)
+        if adv_vbound_lambda > 0:
+            from speedtuning_rl import build_adv_components
+            bo, ti = build_adv_components(n_actions, min_speed, alpha=alpha, beta=beta, gamma=gamma, chunk_T=CHUNK)
+            self.learner.adv_bonus = torch.from_numpy(bo).to(device)
+            self.learner.adv_timing = torch.from_numpy(ti).to(device)
         self.learner.ensure_built(feat_dim)
         self.deli_net = self.deli_mu = self.deli_sd = None
         if delicacy_path and os.path.exists(delicacy_path) and margin_lambda > 0:
@@ -134,7 +142,8 @@ def build_act(ckpt_dir=None):
 
 
 def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_stack=2,
-        delicacy_path='', margin_lambda=0.0, gamma=0.99, mono_lambda=0.0, adv_bound_lambda=0.0):
+        delicacy_path='', margin_lambda=0.0, gamma=0.99, mono_lambda=0.0, adv_bound_lambda=0.0,
+        adv_disc_anchor=1.0, adv_vbound_lambda=0.0):
     set_seed(1000)
     policy, pre, post = build_act()
     env = make_sim_env(TASK); env_max_reward = env.task.max_reward
@@ -142,7 +151,8 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
     feat_dim = k_stack * STATE_DIM + 3 * STATE_DIM
     sp = SpeedPolicy(feat_dim, n_actions, min_speed, alpha, beta, train, gamma=gamma, k_stack=k_stack,
                      state_dim=STATE_DIM, delicacy_path=delicacy_path, margin_lambda=margin_lambda,
-                     mono_lambda=mono_lambda, adv_bound_lambda=adv_bound_lambda)
+                     mono_lambda=mono_lambda, adv_bound_lambda=adv_bound_lambda,
+                     adv_disc_anchor=adv_disc_anchor, adv_vbound_lambda=adv_vbound_lambda)
     if speed_ckpt and os.path.exists(speed_ckpt) and not train:
         sp.load(speed_ckpt); print(f'loaded speed policy {speed_ckpt}')
     SR, S2S, SPD = [], [], []
@@ -205,4 +215,6 @@ if __name__ == '__main__':
         margin_lambda=float(os.environ.get('MARGIN_LAMBDA', '0')),
         gamma=float(os.environ.get('GAMMA', '0.99')),
         mono_lambda=float(os.environ.get('MONO_LAMBDA', '0')),
-        adv_bound_lambda=float(os.environ.get('ADV_BOUND_LAMBDA', '0')))
+        adv_bound_lambda=float(os.environ.get('ADV_BOUND_LAMBDA', '0')),
+        adv_disc_anchor=float(os.environ.get('ADV_DISC_ANCHOR', '1.0')),
+        adv_vbound_lambda=float(os.environ.get('ADV_VBOUND_LAMBDA', '0')))
