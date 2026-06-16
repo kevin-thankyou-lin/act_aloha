@@ -95,7 +95,21 @@ def harvest(ckpt_dir, controller, lap_dir, attempts):
     return saved, lens
 
 
+def _pad(arr, T):
+    """Pad a list to length T by repeating the last element (hold-at-success).
+    ACT's get_norm_stats stacks all episodes -> they must be equal length (=MAX_T)."""
+    a = list(arr)
+    while len(a) < T:
+        a.append(a[-1])
+    return np.asarray(a[:T])
+
+
 def _write_demo(lap_dir, idx, traj):
+    # pad the (short) fast-success trajectory to MAX_T so all demos are equal length
+    for k in ('qpos', 'qvel', 'action'):
+        traj[k] = _pad(traj[k], MAX_T)
+    for c in CAMERAS:
+        traj['img'][c] = _pad(traj['img'][c], MAX_T)
     T = len(traj['action'])
     path = os.path.join(lap_dir, f'episode_{idx}.hdf5')
     with h5py.File(path, 'w', rdcc_nbytes=1024 ** 2 * 2) as root:
