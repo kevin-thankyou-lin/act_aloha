@@ -44,7 +44,8 @@ class SpeedPolicy:
     def __init__(self, feat_dim, n_actions, min_speed, alpha, beta, train,
                  gamma=0.9, lr=3e-4, eps_start=0.5, eps_end=0.05,
                  eps_decay=800, bs=128, learn_start=256, target_sync=200, device='cuda',
-                 delicacy_path='', margin=1.0, margin_lambda=0.0, k_stack=2, state_dim=14):
+                 delicacy_path='', margin=1.0, margin_lambda=0.0, k_stack=2, state_dim=14,
+                 mono_lambda=0.0, mono_tau=0.4):
         self.min_speed, self.alpha, self.beta = min_speed, alpha, beta
         self.k_stack, self.state_dim, self.device = k_stack, state_dim, device
         self.margin, self.margin_lambda = margin, margin_lambda
@@ -52,7 +53,8 @@ class SpeedPolicy:
             n_actions, gamma=gamma, dueling=True, double_q=True, hidden=128, lr=lr,
             eps_start=eps_start, eps_end=eps_end, eps_decay_steps=eps_decay,
             buffer_size=50000, batch_size=bs, learn_start=learn_start,
-            target_sync=target_sync, device=device, train=train)
+            target_sync=target_sync, device=device, train=train,
+            mono_lambda=mono_lambda, mono_tau=mono_tau)
         self.learner.ensure_built(feat_dim)
         self.deli_net = self.deli_mu = self.deli_sd = None
         if delicacy_path and os.path.exists(delicacy_path) and margin_lambda > 0:
@@ -127,14 +129,15 @@ def build_act():
 
 
 def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_stack=2,
-        delicacy_path='', margin_lambda=0.0):
+        delicacy_path='', margin_lambda=0.0, gamma=0.99, mono_lambda=0.0):
     set_seed(1000)
     policy, pre, post = build_act()
     env = make_sim_env(TASK); env_max_reward = env.task.max_reward
     n_actions = max_speed - min_speed + 1
     feat_dim = k_stack * STATE_DIM + 3 * STATE_DIM
-    sp = SpeedPolicy(feat_dim, n_actions, min_speed, alpha, beta, train, k_stack=k_stack,
-                     state_dim=STATE_DIM, delicacy_path=delicacy_path, margin_lambda=margin_lambda)
+    sp = SpeedPolicy(feat_dim, n_actions, min_speed, alpha, beta, train, gamma=gamma, k_stack=k_stack,
+                     state_dim=STATE_DIM, delicacy_path=delicacy_path, margin_lambda=margin_lambda,
+                     mono_lambda=mono_lambda)
     if speed_ckpt and os.path.exists(speed_ckpt) and not train:
         sp.load(speed_ckpt); print(f'loaded speed policy {speed_ckpt}')
     SR, S2S, SPD = [], [], []
@@ -194,4 +197,6 @@ if __name__ == '__main__':
         min_speed=int(os.environ.get('MIN_SPEED', '1')),
         max_speed=int(os.environ.get('MAX_SPEED', '8')),
         delicacy_path=os.environ.get('DELICACY', ''),
-        margin_lambda=float(os.environ.get('MARGIN_LAMBDA', '0')))
+        margin_lambda=float(os.environ.get('MARGIN_LAMBDA', '0')),
+        gamma=float(os.environ.get('GAMMA', '0.99')),
+        mono_lambda=float(os.environ.get('MONO_LAMBDA', '0')))
