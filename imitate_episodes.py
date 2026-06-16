@@ -209,6 +209,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
     chunk_len = policy_config['num_queries']
     if speed > 1 and not temporal_agg:
         query_frequency = int(np.ceil(chunk_len / speed))
+    # exec-horizon sweep: replan every K steps at NATIVE fidelity (no interpolation),
+    # decoupled from speed -> probes how closed-loop the base policy needs to be.
+    exec_h = int(os.environ.get('ACT_EXEC_HORIZON', '0'))
+    if exec_h > 0 and speed == 1 and not temporal_agg:
+        query_frequency = exec_h
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
