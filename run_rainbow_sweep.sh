@@ -14,6 +14,7 @@ export MAX_SPEED="${MAX_SPEED:-5}"
 export GAMMA="${GAMMA:-0.99}"
 export FLAT_DISCOUNT="${FLAT_DISCOUNT:-1}"
 export ST_PER="${ST_PER:-1}"
+export ST_LOG_EVERY="${ST_LOG_EVERY:-10}"
 
 if [[ -n "${SPEEDTUNING_RL_ROOT:-}" ]]; then
   export PYTHONPATH="${SPEEDTUNING_RL_ROOT}:${PYTHONPATH:-}"
@@ -59,6 +60,7 @@ for spec in $task_specs; do
       ALPHA="$alpha" \
       MONO_LAMBDA="$mono_lambda" \
       SPEED_CKPT="$speed_ckpt" \
+      ST_METRICS_JSONL="$run_dir/train_metrics.jsonl" \
       NUM_EPISODES="$train_eps" \
       "$python_bin" aloha_speed.py 2>&1 | tee -a "$log"
 

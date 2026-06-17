@@ -11,8 +11,10 @@ Env vars: MODE(train|eval) ALPHA BETA SPEED_CKPT NUM_EPISODES MIN_SPEED MAX_SPEE
 """
 import collections
 import glob
+import json
 import os
 import pickle
+import time
 
 import numpy as np
 import torch
@@ -78,7 +80,11 @@ class SpeedPolicy:
         self.min_speed, self.alpha, self.beta = min_speed, alpha, beta
         self.k_stack, self.state_dim, self.device = k_stack, state_dim, device
         self.margin, self.margin_lambda = margin, margin_lambda
+        self._last_q_values = None
+        self._last_speed = None
+        self._last_logged_update = 0
         learner_name = os.environ.get('LEARNER', 'dqn').lower()
+        self.learner_name = learner_name
         prioritized = bool(int(os.environ.get('ST_PER', '0')))  # Rainbow PER on the DQN learner
         if learner_name == 'rainbow' and RainbowSpeedQLearner is not None:
             self.learner = RainbowSpeedQLearner(
@@ -123,10 +129,58 @@ class SpeedPolicy:
         return self.learner.epsilon
 
     def select(self, feat):
-        return self.learner.select(feat[None, :]) + self.min_speed
+        state = feat[None, :]
+        action = self.learner.select(state)
+        self._last_speed = action + self.min_speed
+        self._last_q_values = self.q_values(state)
+        return self._last_speed
 
     def observe(self, reward, done, chunk_len=None):
         self.learner.observe(reward, done, chunk_len=chunk_len)
+
+    def q_values(self, state):
+        if hasattr(self.learner, 'q_values'):
+            return self.learner.q_values(state)
+        with torch.no_grad():
+            x = torch.from_numpy(np.asarray(state, np.float32)).to(self.device)
+            return self.learner.qnet(x).detach().cpu().numpy()
+
+    def log_training_metrics(self, path, *, reward, success, done, episode, t, steps_done, log_every):
+        update = int(self.learner.n_update)
+        if not path or not update or update - self._last_logged_update < log_every:
+            return
+        self._last_logged_update = update
+        q = None if self._last_q_values is None else np.asarray(self._last_q_values, np.float64)
+        row = {
+            'time': time.time(),
+            'task': TASK,
+            'learner': self.learner_name,
+            'episode': int(episode),
+            't': int(t),
+            'steps_done': int(steps_done),
+            'update': update,
+            'select': int(self.learner.n_select),
+            'buffer': int(getattr(self.learner.buffer, 'size', 0) if self.learner.buffer is not None else 0),
+            'eps': float(self.eps),
+            'per_beta': float(getattr(self.learner, 'per_beta_now', 0.0)),
+            'loss': None if self.last_loss is None else float(self.last_loss),
+            'speed': float(self._last_speed),
+            'reward': float(reward),
+            'success': float(success),
+            'done': bool(done),
+        }
+        if q is not None and q.size:
+            row.update({
+                'q_mean': float(q.mean()),
+                'q_min': float(q.min()),
+                'q_max': float(q.max()),
+                'greedy_speed': int(q[0].argmax() + self.min_speed),
+            })
+        line = json.dumps(row, sort_keys=True)
+        print(f'[ALOHA-SPEED][train] {line}', flush=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
 
     def _margin_provider(self, qnet):
         # DQfD margin: pin the slow action (idx 0 = min_speed) on delicate states drawn
@@ -200,6 +254,11 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
         sp.load(load_path); print(f'loaded speed policy {load_path}')
     SR, S2S, SPD = [], [], []
     last_ckpt = ''
+    log_every = int(os.environ.get('ST_LOG_EVERY', '10'))
+    metrics_path = os.environ.get('ST_METRICS_JSONL', '')
+    if not metrics_path and speed_ckpt:
+        root, _ = os.path.splitext(speed_ckpt)
+        metrics_path = f'{root}_metrics.jsonl'
     for ep in range(num_episodes):
         BOX_POSE[0] = np.concatenate(sample_insertion_pose()) if 'insertion' in TASK else sample_box_pose()
         ts = env.reset()
@@ -232,6 +291,9 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
             steps_done = max(1, steps_done)
             r = chunk_speed_reward(v, success, alpha=alpha, beta=beta, chunk_len=len(speed_chunk), executed=steps_done)
             sp.observe(r, done, chunk_len=(None if os.environ.get('FLAT_DISCOUNT', '') else steps_done))
+            if train:
+                sp.log_training_metrics(metrics_path, reward=r, success=success, done=done,
+                                        episode=ep + 1, t=t, steps_done=steps_done, log_every=log_every)
         SR.append(1.0 if success else 0.0); SPD.append(float(np.mean(speeds)))
         if success:
             S2S.append(s2s)
