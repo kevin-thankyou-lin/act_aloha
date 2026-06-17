@@ -216,7 +216,7 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
             while len(frames) < k_stack:
                 frames.appendleft(qn)
             feat = np.concatenate(list(frames) + [chunk_embed(speed_chunk)]).astype(np.float32)
-            v = int(os.environ['CONST_SPEED']) if os.environ.get('CONST_SPEED') else sp.select(feat)
+            v = float(os.environ['CONST_SPEED']) if os.environ.get('CONST_SPEED') else sp.select(feat)
             speeds.append(v)
             L = int(np.ceil(len(speed_chunk) / v))
             action_chunk = retime_action_chunk(speed_chunk, v, steps=L)
