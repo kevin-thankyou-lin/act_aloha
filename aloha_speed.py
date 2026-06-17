@@ -22,7 +22,23 @@ from utils import sample_box_pose, sample_insertion_pose, set_seed
 from imitate_episodes import make_policy, get_image
 from sim_env import make_sim_env, BOX_POSE
 
-from speedtuning_rl import SpeedQLearner, margin_loss
+from speedtuning_rl import SpeedQLearner, accelerate_action_chunk, margin_loss, speed_reward
+
+try:  # optional full-Rainbow learner (not in the committed package yet)
+    from speedtuning_rl import RainbowSpeedQLearner
+except ImportError:
+    RainbowSpeedQLearner = None
+
+
+def retime_action_chunk(chunk, v, steps=None):
+    """Linearly accelerate a single-env [T, D] chunk to `steps` (=ceil(T/v)) steps."""
+    return accelerate_action_chunk(chunk, v, horizon=steps)
+
+
+def chunk_speed_reward(v, success, alpha=0.01, beta=1.0, chunk_len=None, executed=None):
+    """Paper-faithful SpeedTuning reward: alpha*v^beta + success (chunk_len/executed
+    accepted for call-site compatibility but unused in the faithful formulation)."""
+    return float(speed_reward(v, success, alpha=alpha, beta=beta))
 
 TASK = os.environ.get('TASK', 'sim_transfer_cube_scripted')
 CKPT_DIR = os.environ.get('BASE_CKPT_DIR', f'ckpt/{TASK}')
@@ -50,13 +66,24 @@ class SpeedPolicy:
         self.min_speed, self.alpha, self.beta = min_speed, alpha, beta
         self.k_stack, self.state_dim, self.device = k_stack, state_dim, device
         self.margin, self.margin_lambda = margin, margin_lambda
-        self.learner = SpeedQLearner(
-            n_actions, gamma=gamma, dueling=True, double_q=True, hidden=128, lr=lr,
-            eps_start=eps_start, eps_end=eps_end, eps_decay_steps=eps_decay,
-            buffer_size=50000, batch_size=bs, learn_start=learn_start,
-            target_sync=target_sync, device=device, train=train,
-            mono_lambda=mono_lambda, mono_tau=mono_tau, adv_bound_lambda=adv_bound_lambda,
-            adv_vbound_lambda=adv_vbound_lambda)
+        learner_name = os.environ.get('LEARNER', 'dqn').lower()
+        prioritized = bool(int(os.environ.get('ST_PER', '0')))  # Rainbow PER on the DQN learner
+        if learner_name == 'rainbow' and RainbowSpeedQLearner is not None:
+            self.learner = RainbowSpeedQLearner(
+                n_actions, gamma=gamma, hidden=128, lr=lr, eps_start=eps_start, eps_end=eps_end,
+                eps_decay_steps=eps_decay, buffer_size=50000, batch_size=bs,
+                learn_start=learn_start, target_sync=target_sync, device=device, train=train)
+        else:
+            if learner_name == 'rainbow':
+                print('[aloha-speed] RainbowSpeedQLearner unavailable; using SpeedQLearner (PER via ST_PER)')
+            self.learner = SpeedQLearner(
+                n_actions, gamma=gamma, dueling=True, double_q=True, hidden=128, lr=lr,
+                eps_start=eps_start, eps_end=eps_end, eps_decay_steps=eps_decay,
+                buffer_size=50000, batch_size=bs, learn_start=learn_start,
+                target_sync=target_sync, device=device, train=train,
+                mono_lambda=mono_lambda, mono_tau=mono_tau, adv_bound_lambda=adv_bound_lambda,
+                adv_vbound_lambda=adv_vbound_lambda, prioritized=prioritized)
+        print(f'[aloha-speed] learner={learner_name} prioritized={prioritized} gamma={gamma}')
         if adv_bound_lambda > 0:
             from speedtuning_rl import build_adv_ceiling
             C = build_adv_ceiling(n_actions, min_speed, alpha=alpha, beta=beta, gamma=gamma, chunk_T=CHUNK,
@@ -149,6 +176,7 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
     env = make_sim_env(TASK); env_max_reward = env.task.max_reward
     n_actions = max_speed - min_speed + 1
     feat_dim = k_stack * STATE_DIM + 3 * STATE_DIM
+    speed_chunk_len = int(os.environ.get('SPEED_CHUNK_LEN', str(CHUNK)))
     sp = SpeedPolicy(feat_dim, n_actions, min_speed, alpha, beta, train, gamma=gamma, k_stack=k_stack,
                      state_dim=STATE_DIM, delicacy_path=delicacy_path, margin_lambda=margin_lambda,
                      mono_lambda=mono_lambda, adv_bound_lambda=adv_bound_lambda,
@@ -168,24 +196,26 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
             img = get_image(ts, CAMERAS)
             with torch.inference_mode():
                 chunk = policy(qpos_t, img)[0].cpu().numpy()  # [CHUNK, D] normalized
+            speed_chunk = chunk[: min(speed_chunk_len, len(chunk))]
             frames.append(qn)
             while len(frames) < k_stack:
                 frames.appendleft(qn)
-            feat = np.concatenate(list(frames) + [chunk_embed(chunk)]).astype(np.float32)
-            v = sp.select(feat); speeds.append(v)
-            L = int(np.ceil(CHUNK / v))
-            for j in range(L):
+            feat = np.concatenate(list(frames) + [chunk_embed(speed_chunk)]).astype(np.float32)
+            v = int(os.environ['CONST_SPEED']) if os.environ.get('CONST_SPEED') else sp.select(feat)
+            speeds.append(v)
+            L = int(np.ceil(len(speed_chunk) / v))
+            action_chunk = retime_action_chunk(speed_chunk, v, steps=L)
+            steps_done = 0
+            for a_norm in action_chunk:
                 if t >= MAX_T or success:
                     break
-                src = min(j * v, CHUNK - 1)
-                lo = int(np.floor(src)); hi = min(lo + 1, CHUNK - 1); frac = src - lo
-                a = chunk[lo] * (1 - frac) + chunk[hi] * frac
-                ts = env.step(post(a)); t += 1
+                ts = env.step(post(a_norm)); t += 1; steps_done += 1
                 if ts.reward == env_max_reward:
                     success, s2s = True, t
             done = success or t >= MAX_T
-            r = alpha * (v ** beta) + (1.0 if success else 0.0)
-            sp.observe(r, done, chunk_len=(None if os.environ.get('FLAT_DISCOUNT', '') else L))
+            steps_done = max(1, steps_done)
+            r = chunk_speed_reward(v, success, alpha=alpha, beta=beta, chunk_len=len(speed_chunk), executed=steps_done)
+            sp.observe(r, done, chunk_len=(None if os.environ.get('FLAT_DISCOUNT', '') else steps_done))
         SR.append(1.0 if success else 0.0); SPD.append(float(np.mean(speeds)))
         if success:
             S2S.append(s2s)
@@ -211,6 +241,7 @@ if __name__ == '__main__':
         num_episodes=int(os.environ.get('NUM_EPISODES', '400' if MODE == 'train' else '30')),
         min_speed=int(os.environ.get('MIN_SPEED', '1')),
         max_speed=int(os.environ.get('MAX_SPEED', '8')),
+        k_stack=int(os.environ.get('K_STACK', '2')),
         delicacy_path=os.environ.get('DELICACY', ''),
         margin_lambda=float(os.environ.get('MARGIN_LAMBDA', '0')),
         gamma=float(os.environ.get('GAMMA', '0.99')),
