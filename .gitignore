@@ -6,6 +6,10 @@ data
 data_local
 .vscode
 _wandb
+ckpt/
+flywheel_runs/
+speedpol_logs/
+*.nohup
 
 **/.DS_Store
 
