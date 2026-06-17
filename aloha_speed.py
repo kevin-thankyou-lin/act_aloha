@@ -190,11 +190,12 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
     n_actions = max_speed - min_speed + 1
     feat_dim = k_stack * STATE_DIM + 3 * STATE_DIM
     speed_chunk_len = int(os.environ.get('SPEED_CHUNK_LEN', str(CHUNK)))
+    const_speed = os.environ.get('CONST_SPEED')
     sp = SpeedPolicy(feat_dim, n_actions, min_speed, alpha, beta, train, gamma=gamma, k_stack=k_stack,
                      state_dim=STATE_DIM, delicacy_path=delicacy_path, margin_lambda=margin_lambda,
                      mono_lambda=mono_lambda, adv_bound_lambda=adv_bound_lambda,
                      adv_disc_anchor=adv_disc_anchor, adv_vbound_lambda=adv_vbound_lambda)
-    if speed_ckpt and not train:
+    if speed_ckpt and not train and not const_speed:
         load_path = latest_snapshot(speed_ckpt)
         sp.load(load_path); print(f'loaded speed policy {load_path}')
     SR, S2S, SPD = [], [], []
@@ -216,7 +217,7 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
             while len(frames) < k_stack:
                 frames.appendleft(qn)
             feat = np.concatenate(list(frames) + [chunk_embed(speed_chunk)]).astype(np.float32)
-            v = float(os.environ['CONST_SPEED']) if os.environ.get('CONST_SPEED') else sp.select(feat)
+            v = float(const_speed) if const_speed else sp.select(feat)
             speeds.append(v)
             L = int(np.ceil(len(speed_chunk) / v))
             action_chunk = retime_action_chunk(speed_chunk, v, steps=L)
