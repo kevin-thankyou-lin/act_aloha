@@ -10,6 +10,7 @@ gamma**L discount). alpha FIXED per run.
 Env vars: MODE(train|eval) ALPHA BETA SPEED_CKPT NUM_EPISODES MIN_SPEED MAX_SPEED.
 """
 import collections
+import glob
 import os
 import pickle
 
@@ -46,6 +47,17 @@ CHUNK = 100
 CAMERAS = ['top']
 STATE_DIM = 14
 MAX_T = SIM_TASK_CONFIGS[TASK]['episode_len'] if TASK in SIM_TASK_CONFIGS else 400
+
+
+def snapshot_path(path, episode):
+    root, ext = os.path.splitext(path)
+    return f"{root}_ep{int(episode):04d}{ext or '.pt'}"
+
+
+def latest_snapshot(path):
+    root, ext = os.path.splitext(path)
+    matches = sorted(glob.glob(f"{root}_ep*{ext or '.pt'}")) or [path]
+    return matches[-1]
 
 
 class SpeedPolicy:
@@ -136,6 +148,7 @@ class SpeedPolicy:
         return self.learner.last_loss
 
     def save(self, p):
+        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
         torch.save({'q': self.learner.qnet.state_dict(), 'min_speed': self.min_speed}, p)
 
     def load(self, p):
@@ -181,9 +194,11 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
                      state_dim=STATE_DIM, delicacy_path=delicacy_path, margin_lambda=margin_lambda,
                      mono_lambda=mono_lambda, adv_bound_lambda=adv_bound_lambda,
                      adv_disc_anchor=adv_disc_anchor, adv_vbound_lambda=adv_vbound_lambda)
-    if speed_ckpt and os.path.exists(speed_ckpt) and not train:
-        sp.load(speed_ckpt); print(f'loaded speed policy {speed_ckpt}')
+    if speed_ckpt and not train:
+        load_path = latest_snapshot(speed_ckpt)
+        sp.load(load_path); print(f'loaded speed policy {load_path}')
     SR, S2S, SPD = [], [], []
+    last_ckpt = ''
     for ep in range(num_episodes):
         BOX_POSE[0] = np.concatenate(sample_insertion_pose()) if 'insertion' in TASK else sample_box_pose()
         ts = env.reset()
@@ -220,12 +235,16 @@ def run(alpha, beta, train, speed_ckpt, num_episodes, min_speed, max_speed, k_st
         if success:
             S2S.append(s2s)
         if train and speed_ckpt and (ep + 1) % 50 == 0:
-            sp.save(speed_ckpt)
+            ck = snapshot_path(speed_ckpt, ep + 1)
+            sp.save(ck); print(f'saved speed policy {ck}')
+            last_ckpt = ck
         if (ep + 1) % 25 == 0:
             print(f'  ep {ep+1}/{num_episodes} SR(last25)={np.mean(SR[-25:]):.2f} '
                   f'meanspeed={np.mean(SPD[-25:]):.2f} eps={sp.eps:.2f} loss={sp.last_loss}')
     if train and speed_ckpt:
-        sp.save(speed_ckpt)
+        ck = snapshot_path(speed_ckpt, num_episodes)
+        if ck != last_ckpt:
+            sp.save(ck); print(f'saved speed policy {ck}')
     mode = 'train' if train else 'eval'
     s2s_m = float(np.mean(S2S)) if S2S else -1.0
     print(f'[ALOHA-SPEED] mode={mode} alpha={alpha} SR={np.mean(SR):.3f} '
