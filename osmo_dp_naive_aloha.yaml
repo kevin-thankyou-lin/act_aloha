@@ -23,6 +23,7 @@ workflow:
         TASK: "{{ task }}"
         MUJOCO_GL: "egl"
         DATA_ROOT: "/mnt/amlfs-04/home/linke/dp_naive_aloha_h100_e60_20260630/data"
+        SOURCE_ROOT: "/mnt/amlfs-04/home/linke/dp_naive_aloha_h100_e60_20260630/source"
         OUT_ROOT: "/mnt/amlfs-04/home/linke/dp_naive_aloha_h100_e60_20260630/runs"
         PRED_HORIZON: "100"
         EXEC_HORIZON: "60"
@@ -44,7 +45,7 @@ workflow:
           test -f "$DATA_MARKER"
           git clone --depth 1 --branch codex/dp-naive-h100-e60-osmo-20260630 \
             https://github.com/kevin-thankyou-lin/act_aloha.git "$ACT_ROOT"
-          git clone --depth 1 https://github.com/nadunRanawaka1/robomimic-SAIL.git "$ROBOMIMIC_ROOT"
+          cp -a "$SOURCE_ROOT/robomimic-SAIL" "$ROBOMIMIC_ROOT"
           pip install -e "$ACT_ROOT/detr"
           pip install mujoco==2.3.3 dm-control==1.0.9 numpy==1.26.4 \
             diffusers torchvision einops h5py opencv-python pyquaternion tqdm ipython matplotlib
