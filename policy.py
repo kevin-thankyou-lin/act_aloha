@@ -1,6 +1,10 @@
+import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torchvision.transforms as transforms
+from torchvision.models import ResNet18_Weights, resnet18
+from diffusers import DDIMScheduler
+from robomimic.algo.diffusion_policy import ConditionalUnet1D
 
 from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_optimizer
 import IPython
@@ -92,6 +96,109 @@ class CNNMLPPolicy(nn.Module):
         else: # inference time
             a_hat = self.model(qpos, image, env_state) # no action, sample from prior
             return a_hat
+
+    def configure_optimizers(self):
+        return self.optimizer
+
+
+class DiffusionPolicy(nn.Module):
+    """Image-conditioned Diffusion Policy with SAIL AWE precision heads."""
+
+    def __init__(self, args_override):
+        super().__init__()
+        self.num_queries = args_override['num_queries']
+        self.num_inference_steps = args_override.get('num_inference_steps', 10)
+        self.precision_weight = args_override.get('precision_weight', 0.1)
+
+        self.image_encoder = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.image_encoder.fc = nn.Identity()
+        self.qpos_encoder = nn.Sequential(
+            nn.Linear(14, 128),
+            nn.Mish(),
+            nn.Linear(128, 128),
+        )
+        cond_dim = 512 + 128
+        self.noise_pred_net = ConditionalUnet1D(
+            input_dim=14,
+            global_cond_dim=cond_dim,
+            down_dims=[128, 256, 512],
+        )
+        self.precision_head = nn.Sequential(
+            nn.Linear(cond_dim + 14, 256),
+            nn.Mish(),
+            nn.Linear(256, args_override.get('num_precision_heads', 3)),
+        )
+        self.noise_scheduler = DDIMScheduler(
+            num_train_timesteps=100,
+            beta_schedule='squaredcos_cap_v2',
+            clip_sample=False,
+            prediction_type='epsilon',
+        )
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(), lr=args_override['lr'], weight_decay=1e-6
+        )
+
+    def encode_obs(self, qpos, image):
+        batch_size, num_cameras = image.shape[:2]
+        image = image.flatten(0, 1)
+        image = F.interpolate(image, size=(240, 320), mode='bilinear', align_corners=False)
+        image = transforms.functional.normalize(
+            image,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        image_features = self.image_encoder(image).reshape(batch_size, num_cameras, -1).mean(1)
+        return torch.cat([image_features, self.qpos_encoder(qpos)], dim=-1)
+
+    def __call__(self, qpos, image, actions=None, is_pad=None, precisions=None):
+        obs_cond = self.encode_obs(qpos, image)
+        if actions is not None:
+            actions = actions[:, :self.num_queries]
+            valid = ~is_pad[:, :self.num_queries]
+            noise = torch.randn_like(actions)
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (actions.shape[0],),
+                device=actions.device,
+            )
+            noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
+            noise_pred = self.noise_pred_net(noisy_actions, timesteps, global_cond=obs_cond)
+            l2 = ((noise_pred - noise).square() * valid.unsqueeze(-1)).sum()
+            l2 = l2 / valid.sum().clamp_min(1) / actions.shape[-1]
+            result = {'l2': l2, 'loss': l2}
+
+            if precisions is not None:
+                precisions = precisions[:, :self.num_queries]
+                repeated_cond = obs_cond.unsqueeze(1).expand(-1, self.num_queries, -1)
+                precision_logits = self.precision_head(torch.cat([repeated_cond, actions], dim=-1))
+                precision_loss = F.binary_cross_entropy_with_logits(
+                    precision_logits, precisions, reduction='none'
+                )
+                mask = valid.unsqueeze(-1)
+                precision_loss = (precision_loss * mask).sum() / mask.sum().clamp_min(1)
+                precision_loss = precision_loss / precisions.shape[-1]
+                precision_accuracy = (
+                    ((precision_logits >= 0) == (precisions >= 0.5)) * mask
+                ).sum() / mask.sum().clamp_min(1) / precisions.shape[-1]
+                result.update(
+                    precision_bce=precision_loss,
+                    precision_accuracy=precision_accuracy,
+                    loss=l2 + self.precision_weight * precision_loss,
+                )
+            return result
+
+        actions = torch.randn(
+            qpos.shape[0], self.num_queries, 14, device=qpos.device, dtype=qpos.dtype
+        )
+        self.noise_scheduler.set_timesteps(self.num_inference_steps, device=qpos.device)
+        for timestep in self.noise_scheduler.timesteps:
+            noise_pred = self.noise_pred_net(actions, timestep, global_cond=obs_cond)
+            actions = self.noise_scheduler.step(noise_pred, timestep, actions).prev_sample
+
+        repeated_cond = obs_cond.unsqueeze(1).expand(-1, self.num_queries, -1)
+        precision_logits = self.precision_head(torch.cat([repeated_cond, actions], dim=-1))
+        return actions, precision_logits
 
     def configure_optimizers(self):
         return self.optimizer

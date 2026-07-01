@@ -13,7 +13,7 @@ from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
-from policy import ACTPolicy, CNNMLPPolicy
+from policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
@@ -81,6 +81,15 @@ def main(args):
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
                          'camera_names': camera_names,}
+    elif policy_class == 'Diffusion':
+        policy_config = {
+            'lr': args['lr'],
+            'num_queries': args['chunk_size'],
+            'num_inference_steps': args['num_inference_steps'],
+            'num_precision_heads': args.get('num_precision_heads', 3),
+            'precision_weight': args.get('precision_weight', 0.1),
+            'camera_names': camera_names,
+        }
     else:
         raise NotImplementedError
 
@@ -154,6 +163,8 @@ def make_policy(policy_class, policy_config):
         policy = ACTPolicy(policy_config)
     elif policy_class == 'CNNMLP':
         policy = CNNMLPPolicy(policy_config)
+    elif policy_class == 'Diffusion':
+        policy = DiffusionPolicy(policy_config)
     else:
         raise NotImplementedError
     return policy
@@ -163,6 +174,8 @@ def make_optimizer(policy_class, policy):
     if policy_class == 'ACT':
         optimizer = policy.configure_optimizers()
     elif policy_class == 'CNNMLP':
+        optimizer = policy.configure_optimizers()
+    elif policy_class == 'Diffusion':
         optimizer = policy.configure_optimizers()
     else:
         raise NotImplementedError
@@ -293,7 +306,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 curr_image = get_image(ts, camera_names)
 
                 ### query policy
-                if config['policy_class'] == "ACT":
+                if config['policy_class'] in ("ACT", "Diffusion"):
                     if t % query_frequency == 0:
                         policy_output = policy(qpos, curr_image)
                         if isinstance(policy_output, tuple):
@@ -383,7 +396,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     print(summary_str)
 
     # save success rate to txt
-    result_suffix = f'awe_h{precision_head}' if dynamic_awe else f'v{speed:g}'
+    eval_seed = os.environ.get('ACT_EVAL_SEED', '1000')
+    result_suffix = f'awe_h{precision_head}_s{eval_seed}' if dynamic_awe else f'v{speed:g}_s{eval_seed}'
     result_file_name = 'result_' + ckpt_name.split('.')[0] + '_' + result_suffix + '.txt'
     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
         f.write(summary_str)
@@ -532,6 +546,7 @@ if __name__ == '__main__':
     parser.add_argument('--precision_weight', type=float, default=1.0)
     parser.add_argument('--precision_threshold', type=float, default=0.5)
     parser.add_argument('--fast_speedup', type=float, default=5.0)
+    parser.add_argument('--num_inference_steps', type=int, default=10)
     parser.add_argument('--dataset_dir', type=str)
     parser.add_argument('--num_episodes_override', type=int)
     
