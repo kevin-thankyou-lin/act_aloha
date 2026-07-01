@@ -86,8 +86,6 @@ def main(args):
             'lr': args['lr'],
             'num_queries': args['chunk_size'],
             'num_inference_steps': args['num_inference_steps'],
-            'num_precision_heads': args.get('num_precision_heads', 3),
-            'precision_weight': args.get('precision_weight', 0.1),
             'camera_names': camera_names,
         }
     else:

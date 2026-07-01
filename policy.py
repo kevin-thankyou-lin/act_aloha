@@ -102,13 +102,12 @@ class CNNMLPPolicy(nn.Module):
 
 
 class DiffusionPolicy(nn.Module):
-    """Image-conditioned Diffusion Policy with SAIL AWE precision heads."""
+    """Naive image-conditioned Diffusion Policy action predictor."""
 
     def __init__(self, args_override):
         super().__init__()
         self.num_queries = args_override['num_queries']
         self.num_inference_steps = args_override.get('num_inference_steps', 10)
-        self.precision_weight = args_override.get('precision_weight', 0.1)
 
         self.image_encoder = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.image_encoder.fc = nn.Identity()
@@ -122,11 +121,6 @@ class DiffusionPolicy(nn.Module):
             input_dim=14,
             global_cond_dim=cond_dim,
             down_dims=[128, 256, 512],
-        )
-        self.precision_head = nn.Sequential(
-            nn.Linear(cond_dim + 14, 256),
-            nn.Mish(),
-            nn.Linear(256, args_override.get('num_precision_heads', 3)),
         )
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=100,
@@ -166,27 +160,7 @@ class DiffusionPolicy(nn.Module):
             noise_pred = self.noise_pred_net(noisy_actions, timesteps, global_cond=obs_cond)
             l2 = ((noise_pred - noise).square() * valid.unsqueeze(-1)).sum()
             l2 = l2 / valid.sum().clamp_min(1) / actions.shape[-1]
-            result = {'l2': l2, 'loss': l2}
-
-            if precisions is not None:
-                precisions = precisions[:, :self.num_queries]
-                repeated_cond = obs_cond.unsqueeze(1).expand(-1, self.num_queries, -1)
-                precision_logits = self.precision_head(torch.cat([repeated_cond, actions], dim=-1))
-                precision_loss = F.binary_cross_entropy_with_logits(
-                    precision_logits, precisions, reduction='none'
-                )
-                mask = valid.unsqueeze(-1)
-                precision_loss = (precision_loss * mask).sum() / mask.sum().clamp_min(1)
-                precision_loss = precision_loss / precisions.shape[-1]
-                precision_accuracy = (
-                    ((precision_logits >= 0) == (precisions >= 0.5)) * mask
-                ).sum() / mask.sum().clamp_min(1) / precisions.shape[-1]
-                result.update(
-                    precision_bce=precision_loss,
-                    precision_accuracy=precision_accuracy,
-                    loss=l2 + self.precision_weight * precision_loss,
-                )
-            return result
+            return {'l2': l2, 'loss': l2}
 
         actions = torch.randn(
             qpos.shape[0], self.num_queries, 14, device=qpos.device, dtype=qpos.dtype
@@ -195,10 +169,7 @@ class DiffusionPolicy(nn.Module):
         for timestep in self.noise_scheduler.timesteps:
             noise_pred = self.noise_pred_net(actions, timestep, global_cond=obs_cond)
             actions = self.noise_scheduler.step(noise_pred, timestep, actions).prev_sample
-
-        repeated_cond = obs_cond.unsqueeze(1).expand(-1, self.num_queries, -1)
-        precision_logits = self.precision_head(torch.cat([repeated_cond, actions], dim=-1))
-        return actions, precision_logits
+        return actions
 
     def configure_optimizers(self):
         return self.optimizer
