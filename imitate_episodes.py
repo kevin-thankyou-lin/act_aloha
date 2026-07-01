@@ -32,6 +32,7 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+    precision_key = args.get('precision_key')
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_' or task_name.startswith('_flywheel_')
@@ -45,12 +46,12 @@ def main(args):
         task_config['num_episodes'] = int(_os.environ['FLYWHEEL_NUM_EPISODES'])
     elif is_sim:
         from constants import SIM_TASK_CONFIGS
-        task_config = SIM_TASK_CONFIGS[task_name]
+        task_config = dict(SIM_TASK_CONFIGS[task_name])
     else:
         from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
+    dataset_dir = args.get('dataset_dir') or task_config['dataset_dir']
+    num_episodes = args.get('num_episodes_override') or task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
@@ -73,6 +74,9 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'num_precision_heads': args.get('num_precision_heads', 0),
+                         'precision_only': bool(precision_key),
+                         'precision_weight': args.get('precision_weight', 1.0),
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -96,6 +100,9 @@ def main(args):
         'real_robot': not is_sim,
         'speed': int(os.environ.get('ACT_SPEED', '1')),
         'num_rollouts': int(os.environ.get('ACT_NUM_ROLLOUTS', '50')),
+        'precision_key': precision_key,
+        'precision_threshold': args.get('precision_threshold', 0.5),
+        'fast_speedup': args.get('fast_speedup', 5.0),
     }
 
     if is_eval:
@@ -110,7 +117,21 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    base_stats = None
+    if precision_key:
+        base_stats_path = os.environ.get('AWE_BASE_STATS')
+        if not base_stats_path and os.environ.get('AWE_INIT_CKPT'):
+            base_stats_path = os.path.join(
+                os.path.dirname(os.environ['AWE_INIT_CKPT']), 'dataset_stats.pkl'
+            )
+        if base_stats_path:
+            with open(base_stats_path, 'rb') as f:
+                base_stats = pickle.load(f)
+            print(f'[SAILAWE] using base action normalization from {base_stats_path}')
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
+        precision_key=precision_key, norm_stats=base_stats,
+    )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -175,7 +196,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path), strict=False)
     print(loading_status)
     policy.cuda()
     policy.eval()
@@ -206,6 +227,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # SpeedTuning fixed-speed baseline: accelerate the chunk by `speed` via linear
     # temporal interpolation and replan after the (shortened) chunk is consumed.
     speed = config.get('speed', 1)
+    dynamic_awe = bool(config.get('precision_key')) and os.environ.get('AWE_DYNAMIC', '1') == '1'
+    precision_head = int(os.environ.get('AWE_HEAD_INDEX', '0'))
     chunk_len = policy_config['num_queries']
     if speed > 1 and not temporal_agg:
         query_frequency = int(np.ceil(chunk_len / speed))
@@ -221,6 +244,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     steps_to_success_list = []
     episode_returns = []
     highest_rewards = []
+    precision_fractions = []
     for rollout_id in range(num_rollouts):
         rollout_id += 0
         ### set task
@@ -246,6 +270,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
         qpos_list = []
         target_qpos_list = []
         rewards = []
+        equivalent_steps = []
+        elapsed_equivalent_steps = 0.0
         with torch.inference_mode():
             for t in range(max_timesteps):
                 ### update onscreen render and wait for DT
@@ -269,7 +295,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 ### query policy
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image)
+                        policy_output = policy(qpos, curr_image)
+                        if isinstance(policy_output, tuple):
+                            all_actions, all_precisions = policy_output
+                        else:
+                            all_actions = policy_output
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t]
@@ -287,6 +317,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         raw_action = all_actions[:, lo] * (1 - frac) + all_actions[:, hi] * frac
                     else:
                         raw_action = all_actions[:, t % query_frequency]
+                    if dynamic_awe:
+                        raw_precision = all_precisions[:, t % query_frequency, precision_head]
                 elif config['policy_class'] == "CNNMLP":
                     raw_action = policy(qpos, curr_image)
                 else:
@@ -298,7 +330,17 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 target_qpos = action
 
                 ### step the environment
+                if dynamic_awe:
+                    precise = torch.sigmoid(raw_precision).item() >= config['precision_threshold']
+                    slow_substeps = getattr(env, '_awe_slow_substeps', env._n_sub_steps)
+                    env._awe_slow_substeps = slow_substeps
+                    env._n_sub_steps = slow_substeps if precise else round(
+                        slow_substeps / config['fast_speedup']
+                    )
+                    precision_fractions.append(float(precise))
                 ts = env.step(target_qpos)
+                elapsed_equivalent_steps += 1.0 if not dynamic_awe or precise else 1.0 / config['fast_speedup']
+                equivalent_steps.append(elapsed_equivalent_steps)
 
                 ### for visualization
                 qpos_list.append(qpos_numpy)
@@ -313,7 +355,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
         rewards = np.array(rewards)
         _succ_idx = np.where(rewards == env_max_reward)[0]
         if len(_succ_idx) > 0:
-            steps_to_success_list.append(int(_succ_idx[0]))   # sim-step of first success
+            if dynamic_awe:
+                steps_to_success_list.append(float(equivalent_steps[_succ_idx[0]]))
+            else:
+                steps_to_success_list.append(int(_succ_idx[0]) + 1)
         episode_return = np.sum(rewards[rewards!=None])
         episode_returns.append(episode_return)
         episode_highest_reward = np.max(rewards)
@@ -327,6 +372,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     avg_return = np.mean(episode_returns)
     mean_s2s = float(np.mean(steps_to_success_list)) if steps_to_success_list else -1.0
     print(f'[SPEEDBASE] speed={speed} success_rate={success_rate} mean_steps_to_success={mean_s2s} n_success={len(steps_to_success_list)}/{num_rollouts}')
+    if dynamic_awe:
+        print(f'[SAILAWE] head={precision_head} success_rate={success_rate} mean_steps_to_success={mean_s2s} precision_fraction={np.mean(precision_fractions):.6f} n_success={len(steps_to_success_list)}/{num_rollouts}')
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\nmean_steps_to_success: {mean_s2s}\n\n'
     for r in range(env_max_reward+1):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
@@ -336,7 +383,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     print(summary_str)
 
     # save success rate to txt
-    result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
+    result_suffix = f'awe_h{precision_head}' if dynamic_awe else f'v{speed:g}'
+    result_file_name = 'result_' + ckpt_name.split('.')[0] + '_' + result_suffix + '.txt'
     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
         f.write(summary_str)
         f.write(repr(episode_returns))
@@ -347,9 +395,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
+    if len(data) == 5:
+        image_data, qpos_data, action_data, is_pad, precisions = data
+        precisions = precisions.cuda()
+    else:
+        image_data, qpos_data, action_data, is_pad = data
+        precisions = None
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    return policy(qpos_data, image_data, action_data, is_pad, precisions=precisions) # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -362,6 +415,13 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
+    _awe_init = os.environ.get('AWE_INIT_CKPT', '')
+    if _awe_init:
+        status = policy.load_state_dict(torch.load(_awe_init), strict=False)
+        expected = {'model.precision_head.weight', 'model.precision_head.bias'}
+        if set(status.missing_keys) != expected or status.unexpected_keys:
+            raise RuntimeError(f'Unexpected AWE warm-start mismatch: {status}')
+        print(f'[SAILAWE] warm-started action policy from {_awe_init}')
     _init = os.environ.get('FLYWHEEL_INIT_CKPT', '')
     if _init and os.path.exists(_init):
         policy.load_state_dict(torch.load(_init)); print(f'[flywheel] warm-started from {_init}')
@@ -467,5 +527,12 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--precision_key', type=str)
+    parser.add_argument('--num_precision_heads', type=int, default=0)
+    parser.add_argument('--precision_weight', type=float, default=1.0)
+    parser.add_argument('--precision_threshold', type=float, default=0.5)
+    parser.add_argument('--fast_speedup', type=float, default=5.0)
+    parser.add_argument('--dataset_dir', type=str)
+    parser.add_argument('--num_episodes_override', type=int)
     
     main(vars(parser.parse_args()))
