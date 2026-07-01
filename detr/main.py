@@ -63,6 +63,13 @@ def get_args_parser():
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--precision_key', type=str)
+    parser.add_argument('--num_precision_heads', type=int, default=0)
+    parser.add_argument('--precision_weight', type=float, default=1.0)
+    parser.add_argument('--precision_threshold', type=float, default=0.5)
+    parser.add_argument('--fast_speedup', type=float, default=5.0)
+    parser.add_argument('--dataset_dir', type=str)
+    parser.add_argument('--num_episodes_override', type=int)
 
     return parser
 
@@ -76,6 +83,12 @@ def build_ACT_model_and_optimizer(args_override):
 
     model = build_ACT_model(args)
     model.cuda()
+
+    if getattr(args, 'precision_only', False):
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        for parameter in model.precision_head.parameters():
+            parameter.requires_grad = True
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -111,4 +124,3 @@ def build_CNNMLP_model_and_optimizer(args_override):
                                   weight_decay=args.weight_decay)
 
     return model, optimizer
-

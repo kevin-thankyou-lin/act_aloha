@@ -33,7 +33,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names,
+                 num_precision_heads=0):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -50,6 +51,9 @@ class DETRVAE(nn.Module):
         self.encoder = encoder
         hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, state_dim)
+        self.precision_head = (
+            nn.Linear(hidden_dim, num_precision_heads) if num_precision_heads else None
+        )
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if backbones is not None:
@@ -136,7 +140,8 @@ class DETRVAE(nn.Module):
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
-        return a_hat, is_pad_hat, [mu, logvar]
+        precision_hat = self.precision_head(hs) if self.precision_head is not None else None
+        return a_hat, is_pad_hat, precision_hat, [mu, logvar]
 
 
 
@@ -247,6 +252,7 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
+        num_precision_heads=getattr(args, 'num_precision_heads', 0),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -275,4 +281,3 @@ def build_cnnmlp(args):
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 
     return model
-

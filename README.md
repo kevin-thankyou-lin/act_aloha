@@ -82,8 +82,18 @@ To evaluate the policy, run the same command but add ``--eval``. This loads the 
 The success rate should be around 90% for transfer cube, and around 50% for insertion.
 To enable temporal ensembling, add flag ``--temporal_agg``.
 Videos will be saved to ``<ckpt_dir>`` for each rollout.
+
+### SAIL/AWE precision heads
+
+An ACT checkpoint can be kept frozen while training one or more binary precision heads on
+``awe_precisions`` targets stored in each episode HDF5. Pass ``--precision_key awe_precisions``
+and ``--num_precision_heads N``, and warm-start with ``AWE_INIT_CKPT``. At evaluation,
+``AWE_DYNAMIC=1`` executes predicted precision actions for the native 20 ms ALOHA step and other
+actions for one fifth as long (4 ms, matching SAIL's 1x/5x ratio);
+``AWE_HEAD_INDEX`` selects the AWE setting. The action-policy weights and action normalization are
+preserved from the warm-start checkpoint, so fixed-speed and learned-schedule evaluations use the
+same underlying policy.
 You can also add ``--onscreen_render`` to see real-time rendering during evaluation.
 
 For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
 Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
-

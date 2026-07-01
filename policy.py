@@ -13,18 +13,37 @@ class ACTPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        self.precision_only = args_override.get('precision_only', False)
+        self.precision_weight = args_override.get('precision_weight', 1.0)
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, precisions=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
         image = normalize(image)
+        if precisions is not None:
+            precisions = precisions[:, :self.model.num_queries]
+            is_pad = is_pad[:, :self.model.num_queries]
+            _, _, precision_hat, _ = self.model(qpos, image, env_state)
+            mask = ~is_pad.unsqueeze(-1)
+            precision_loss = F.binary_cross_entropy_with_logits(
+                precision_hat, precisions, reduction='none'
+            )
+            precision_loss = (precision_loss * mask).sum() / mask.sum() / precisions.shape[-1]
+            precision_accuracy = (
+                ((precision_hat >= 0) == (precisions >= 0.5)) * mask
+            ).sum() / mask.sum() / precisions.shape[-1]
+            return {
+                'precision_bce': precision_loss,
+                'precision_accuracy': precision_accuracy,
+                'loss': self.precision_weight * precision_loss,
+            }
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad)
+            a_hat, is_pad_hat, _, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
@@ -34,11 +53,20 @@ class ACTPolicy(nn.Module):
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state) # no action, sample from prior
-            return a_hat
+            a_hat, _, precision_hat, (_, _) = self.model(qpos, image, env_state)
+            return (a_hat, precision_hat) if precision_hat is not None else a_hat
 
     def configure_optimizers(self):
         return self.optimizer
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.precision_only:
+            # The frozen action policy is an inference-time feature extractor.
+            # Keep its BatchNorm and dropout behavior identical during head training.
+            self.model.eval()
+            self.model.precision_head.train(mode)
+        return self
 
 
 class CNNMLPPolicy(nn.Module):
