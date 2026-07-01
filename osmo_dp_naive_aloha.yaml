@@ -35,6 +35,13 @@ workflow:
           ROOT=/osmo/run/workspace
           ACT_ROOT="$ROOT/act_aloha"
           ROBOMIMIC_ROOT="$ROOT/robomimic-SAIL"
+          DATA_MARKER="$DATA_ROOT/.complete"
+          echo "waiting for staged dataset marker: $DATA_MARKER"
+          for _ in $(seq 1 720); do
+            [ -f "$DATA_MARKER" ] && break
+            sleep 5
+          done
+          test -f "$DATA_MARKER"
           git clone --depth 1 --branch codex/dp-naive-h100-e60-osmo-20260630 \
             https://github.com/kevin-thankyou-lin/act_aloha.git "$ACT_ROOT"
           git clone --depth 1 https://github.com/nadunRanawaka1/robomimic-SAIL.git "$ROBOMIMIC_ROOT"
